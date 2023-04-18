@@ -1,6 +1,6 @@
 <?php
 
-declare(strict_types = 1);
+declare(strict_types=1);
 
 namespace OpenEuropa\Provider\WebtoolsGeocoding;
 
@@ -13,7 +13,7 @@ use Geocoder\Model\Address;
 use Geocoder\Model\AddressCollection;
 use Geocoder\Query\GeocodeQuery;
 use Geocoder\Query\ReverseQuery;
-use Http\Client\HttpClient;
+use Psr\Http\Client\ClientInterface;
 use Psr\Http\Message\RequestInterface;
 
 /**
@@ -24,7 +24,31 @@ class WebtoolsGeocoding extends AbstractHttpProvider
     /**
      * @var string
      */
-    const ENDPOINT_URL = 'https://europa.eu/webtools/rest/geocoding/?f=json&text=%s&maxLocations=%d&outFields=*';
+    private const ENDPOINT_URL = 'https://gisco-services.ec.europa.eu/api?q=%s&limit=%s';
+
+    /**
+     * @var string[]
+     */
+    private const PROPERTY_MAPPING = [
+        'streetName' => 'street',
+        'streetNumber' => 'housenumber',
+        'locality' => 'city',
+        'subLocality' => 'locality',
+        'postalCode' => 'postcode',
+        'countryCode' => 'countrycode',
+        'country' => 'country',
+    ];
+
+    /**
+     * @var int
+     */
+    private const ADMIN_LEVELS = [
+        'state' => 1,
+        'county' => 2,
+        'city' => 3,
+        'district' => 4,
+        'locality' => 5,
+    ];
 
     /**
      * Optional referer.
@@ -36,7 +60,7 @@ class WebtoolsGeocoding extends AbstractHttpProvider
     /**
      * Constructs a WebtoolsGeocoding provider.
      */
-    public function __construct(HttpClient $client, ?string $referer = null)
+    public function __construct(ClientInterface $client, ?string $referer = null)
     {
         parent::__construct($client);
         $this->referer = $referer;
@@ -52,14 +76,15 @@ class WebtoolsGeocoding extends AbstractHttpProvider
 
     /**
      * {@inheritdoc}
+     *
+     * @SuppressWarnings(PHPMD.CyclomaticComplexity)
+     * @SuppressWarnings(PHPMD.NPathComplexity)
      */
     public function geocodeQuery(GeocodeQuery $query): Collection
     {
         $address = $query->getText();
         if (filter_var($address, FILTER_VALIDATE_IP)) {
-            throw new UnsupportedOperation(
-                'The WebtoolsGeocoding provider does not support IP addresses, only street addresses.'
-            );
+            throw new UnsupportedOperation('The WebtoolsGeocoding provider does not support IP addresses, only street addresses.');
         }
 
         // Save a request if no valid address entered
@@ -68,27 +93,21 @@ class WebtoolsGeocoding extends AbstractHttpProvider
         }
 
         $url = sprintf(self::ENDPOINT_URL, urlencode($address), $query->getLimit());
-        $json = $this->getUrlContents($url);
-        $content = json_decode($json);
+        $content = json_decode($this->getUrlContents($url));
 
         if (empty($content)) {
             throw InvalidServerResponse::create($url);
         }
 
-        if (empty($content->locations)) {
+        if (empty($content->features)) {
             return new AddressCollection([]);
         }
 
         $results = [];
-        foreach ($content->locations as $location) {
-            if (empty($location->feature)) {
-                continue;
+        foreach ($content->features as $feature) {
+            if ($addressData = $this->getAddressData($feature)) {
+                $results[] = Address::createFromArray($addressData);
             }
-
-            $address_data = $this->getAddressData($location->feature);
-            $address_data['providedBy'] = $this->getName();
-
-            $results[] = Address::createFromArray($address_data);
         }
 
         return new AddressCollection($results);
@@ -109,52 +128,59 @@ class WebtoolsGeocoding extends AbstractHttpProvider
      *   The location feature JSON object, as returned by the Webtools Geocoding
      *   REST API.
      *
-     * @return array
+     * @return array|null
      *   An array of estimated address data, with the following keys:
      *   - streetNumber: the street number.
      *   - streetName: the street name.
      *   - locality: the locality.
+     *   - subLocality: the sub-locality.
      *   - postalCode: the postal code.
      *   - countryCode: the country code.
+     *   - country: the coutry name.
      *   - longitude: the longitude.
      *   - latitude: the latitude.
      *   - adminLevels: an array of administration levels.
+     *
+     * @SuppressWarnings(PHPMD.CyclomaticComplexity)
+     * @SuppressWarnings(PHPMD.NPathComplexity)
      */
-    protected function getAddressData(\stdClass $feature): array
+    protected function getAddressData(\stdClass $feature): ?array
     {
-        $attributes = $feature->attributes ?? null;
-        $geometry = $feature->geometry ?? null;
+        $addressData = ['providedBy' => $this->getName()];
+        if (!isset($feature->geometry->coordinates[0])
+            || !is_float($feature->geometry->coordinates[0])
+            || !isset($feature->geometry->coordinates[1])
+            || !is_float($feature->geometry->coordinates[1])
+        ) {
+            return null;
+        }
+        $addressData['longitude'] = $feature->geometry->coordinates[0];
+        $addressData['latitude'] = $feature->geometry->coordinates[1];
 
-        $address_data = [];
-
-        $address_data['latitude'] = $geometry->y ?? null;
-        $address_data['longitude'] = $geometry->x ?? null;
-
-        $mapping = [
-            'streetName' => 'StAddr',
-            'streetNumber' => 'AddNum',
-            'locality' => 'City',
-            'postalCode' => 'Postal',
-            'countryCode' => 'Country',
-        ];
-
-        foreach ($mapping as $address_part => $attribute_id) {
-            $address_data[$address_part] = !empty($attributes->{$attribute_id}) ? $attributes->{$attribute_id} : null;
+        if (isset($feature->properties->extent) && is_array($feature->properties->extent) && count($feature->properties->extent) === 4) {
+            $addressData['bounds'] = [
+                'south' => $feature->properties->extent[3],
+                'west' => $feature->properties->extent[0],
+                'north' => $feature->properties->extent[1],
+                'east' => $feature->properties->extent[2],
+            ];
         }
 
-        $admin_levels = [];
-        foreach (['Region', 'Subregion'] as $i => $attribute_id) {
-            if (!empty($attributes->{$attribute_id})) {
-                $admin_levels[] = [
-                    'name' => $attributes->{$attribute_id},
-                    'level' => $i + 1,
+        foreach (static::PROPERTY_MAPPING as $addressPart => $propertyId) {
+            $addressData[$addressPart] = $feature->properties->{$propertyId} ?? null;
+        }
+
+        $addressData['adminLevels'] = [];
+        foreach (static::ADMIN_LEVELS as $propertyId => $level) {
+            if (isset($feature->properties->{$propertyId})) {
+                $addressData['adminLevels'][] = [
+                    'name' => $feature->properties->{$propertyId},
+                    'level' => $level,
                 ];
             }
         }
 
-        $address_data['adminLevels'] = $admin_levels;
-
-        return $address_data;
+        return $addressData;
     }
 
     /**
