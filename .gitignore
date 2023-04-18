@@ -1,3 +1,5 @@
 /composer.lock
 /vendor/
+docker-compose.*.yml
+.idea
 /.phpunit.result.cache
